@@ -1,0 +1,650 @@
+#version 450
+//#extension GL_ARB_separate_shader_objects : enable
+//#extension GL_ARB_shading_language_420pack : enable
+//#extension GL_EXT_scalar_block_layout : enable
+
+layout (local_size_x = 8, local_size_y = 8) in;
+layout (binding = 0, rgba8) uniform image2D computeImage;
+
+#define PI 3.141592
+#define INV_PI 0.3183
+#define Inf 1000000.0
+#define Epsilon 0.0001
+
+#define GAMMA 2.2
+#define MaxBounces 5
+#define SHADOW 0.5
+#define MOTION_BLUR 0
+#define AMBIENT_COLOR 0.
+#define ENABLE_AMBIENT_OCCLUSION 1
+
+struct Material
+{
+	vec4 emissive;
+    float diffuse;
+    float specular;
+    float shininess;
+    float ior;
+};
+
+struct Plane
+{
+    vec3 position;
+    float pad0;
+    vec3 normal;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+struct Sphere
+{
+    vec3 position;
+    float pad0;
+    vec3 color;
+    float radius;
+    Material mat;
+};
+
+struct Box {
+    vec3 min;
+    float pad0;
+    vec3 max;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+struct DirectLight {
+    vec3 direction;
+    float intensity;
+    vec3 color;
+    float pad0;
+};
+
+struct SpotLight {
+    vec3 position;
+    float intensity;
+    vec3 color;
+    float radius;
+};
+
+layout (binding = 1) buffer SphereBuffer
+{
+    Sphere spheres[];
+};
+
+layout (binding = 2) buffer PlaneBuffer
+{
+    Plane planes[];
+};
+
+layout (binding = 3) buffer BoxBuffer
+{
+    Box boxes[];
+};
+
+layout (binding = 4) buffer SpotLightBuf
+{
+    SpotLight spotLights[];
+};
+
+layout (binding = 5) buffer DirectLightBuf {
+    DirectLight directLights[];
+};
+
+layout (push_constant) uniform CameraSettings
+{
+    vec4 position;
+    vec4 old_position;
+    vec4 forward;
+    vec4 old_forward;
+    vec4 up;
+    float aspectRatio;
+    float focalDistance;
+    float _padding[2];
+} camera;
+
+//////////////////////////////
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+    vec3 inv_dir;
+};
+
+struct RayHit
+{
+    vec3 position;
+    float distance;
+    float distanceMax;
+    vec3 normal;
+
+    vec3 emission;
+    vec3 emissive;
+
+    float roughness;
+    float specular;
+    float shininess;
+    float refractionIndex;
+};
+
+vec2 _Pixel;
+float _Seed;
+
+float PHI = 1.61803398874989484820459;// Φ = Golden Ratio
+
+/*float rand(){
+    //_Seed += 1;
+	return fract(tan(distance(_Pixel * PHI, _Pixel) * _Seed) * _Pixel.x);
+}*/
+
+float rand() {
+    float result = fract(sin(_Seed / 100.0 * dot(_Pixel, vec2(12.9898, 78.233))) * 43758.5453);
+    _Seed += 1.0;
+    return result;
+}
+
+vec3 randVec() {
+    return vec3(rand(), rand(), rand());
+}
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = vec3(0.);
+    hit.distance = Inf;
+    hit.normal = vec3(0.);
+
+    hit.emission = vec3(0.);
+
+    hit.roughness = 0;
+    hit.specular = 0;
+    hit.shininess = 0;
+    hit.refractionIndex = 0;
+    return hit;
+}
+
+Ray CreateRay(in vec3 origin, in vec3 dir) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray.inv_dir = 1 / dir;
+    return ray;
+}
+
+Ray CreateCameraRay(in float px, in float py)
+{
+    ivec2 dimensions = imageSize(computeImage);
+    float w = dimensions.x;
+    float h = dimensions.y;
+
+    float i = ((px / w) - 0.5) * camera.focalDistance * camera.aspectRatio;
+    float j = (-(py / h) + 0.5) * camera.focalDistance;
+
+    vec3 right = normalize(cross(camera.old_forward.xyz, camera.up.xyz));
+    vec3 up = cross(right, camera.old_forward.xyz);
+    vec3 oldDir = normalize(camera.old_forward.xyz + (right * i) + (up * j));
+
+    right = normalize(cross(camera.forward.xyz, camera.up.xyz));
+    up = cross(right, camera.forward.xyz);
+    vec3 dir = normalize(camera.forward.xyz + (right * i) + (up * j));
+
+    return CreateRay(camera.position.xyz, dir);
+}
+
+vec3 randomSpherePoint(vec3 rand) {
+    float ang1 = (rand.x + 1.0) * PI;// [-1..1) -> [0..2*PI)
+    float u = rand.y;// [-1..1), cos and acos(2v-1) cancel each other out, so we arrive at [-1..1)
+    float u2 = u * u;
+    float sqrt1MinusU2 = sqrt(1.0 - u2);
+    float x = sqrt1MinusU2 * cos(ang1);
+    float y = sqrt1MinusU2 * sin(ang1);
+    float z = u;
+    return vec3(x, y, z);
+}
+
+vec3 randomHemispherePoint(vec3 rand, vec3 n) {
+    /**
+     * Generate random sphere point and swap vector along the normal, if it
+     * points to the wrong of the two hemispheres.
+     * This method provides a uniform distribution over the hemisphere,
+     * provided that the sphere distribution is also uniform.
+     */
+    vec3 v = randomSpherePoint(rand);
+    return v * sign(dot(v, n));
+}
+
+vec3 randomCosineWeightedHemispherePoint(vec3 rand, vec3 n) {
+    float r = rand.x * 0.5 + 0.5;// [-1..1) -> [0..1)
+    float angle = (rand.y + 1.0) * PI;// [-1..1] -> [0..2*PI)
+    float sr = sqrt(r);
+    vec2 p = vec2(sr * cos(angle), sr * sin(angle));
+    /*
+     * Unproject disk point up onto hemisphere:
+     * 1.0 == sqrt(x*x + y*y + z*z) -> z = sqrt(1.0 - x*x - y*y)
+     */
+    vec3 ph = vec3(p.xy, sqrt(1.0 - p*p));
+    /*
+     * Compute some arbitrary tangent space for orienting
+     * our hemisphere 'ph' around the normal. We use the camera's up vector
+     * to have some fix reference vector over the whole screen.
+     */
+    vec3 tangent = normalize(rand);
+    vec3 bitangent = cross(tangent, n);
+    tangent = cross(bitangent, n);
+
+    /* Make our hemisphere orient around the normal. */
+    return tangent * ph.x + bitangent * ph.y + n * ph.z;
+}
+
+void HitMaterial(inout RayHit hit, in vec3 emission, in Material mat) {
+    hit.emission = emission;
+    hit.roughness = mat.diffuse;
+    hit.specular = mat.specular;
+    hit.shininess = mat.shininess;
+    hit.refractionIndex = mat.ior;
+}
+
+bool IntersectPlane(in Ray ray, inout RayHit hit, in Plane plane)
+{
+    float d0 = dot(plane.normal, ray.direction);
+    if (d0 != 0)
+    {
+        float t = dot(plane.position - ray.origin, plane.normal) / d0;
+        if (t > Epsilon && t < hit.distance) {
+            hit.distance = hit.distanceMax = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = plane.normal;
+            HitMaterial(hit, plane.color, plane.mat);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IntersectBox(in Ray ray, inout RayHit hit, in Box box)
+{
+    vec3 t1 = ray.inv_dir * (box.min - ray.origin);
+    vec3 t2 = ray.inv_dir * (box.max - ray.origin);
+    vec3 tminv = min(t1, t2);
+    vec3 tmaxv = max(t1, t2);
+
+    float tmin = max(max(tminv.x, 0), max(tminv.y, tminv.z));
+    float tmax = min(tmaxv.x, min(tmaxv.y, tmaxv.z));
+
+    if (tmin <= 0) tmin = tmax;
+
+    if (tmax >= max(tmin, 0.0) && tmin < hit.distance) {
+        hit.distance = tmin;
+        hit.distanceMax = tmax;
+        hit.position = ray.origin + tmin * ray.direction;
+        vec3 norm = -sign(ray.direction) * step(tminv.yzx, tminv.xyz) * step(tminv.zxy, tminv.xyz);
+        hit.normal = norm;
+        HitMaterial(hit, box.color, box.mat);
+        return true;
+    }
+    return false;
+}
+
+bool IntersectSphere(in Ray ray, inout RayHit hit, in Sphere sphere)
+{
+    vec3 d = sphere.position - ray.origin;
+    float p1 = dot(d, ray.direction);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+    if (p2sqr < 0) return false;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    bool inside = p1 - p2 <= 0;
+
+    if (t > 0 && t < hit.distance) {
+        hit.distance = t;
+        hit.distanceMax = p1 > p2 ? p1 + p2 : p1 - p2;
+        hit.position = ray.origin + ray.direction * t;
+        hit.normal = inside ? ((sphere.position - hit.position) / sphere.radius) : ((hit.position - sphere.position) / sphere.radius);
+        HitMaterial(hit, sphere.color, sphere.mat);
+        return true;
+    }
+    return false;
+}
+
+bool IntersectSpotLight(in Ray ray, inout RayHit hit, in SpotLight light) {
+    vec3 d = light.position - ray.origin;
+    float p1 = dot(d, ray.direction);
+    float p2sqr = p1 * p1 - dot(d, d) + light.radius * light.radius;
+    if (p2sqr < 0) return false;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    bool inside = p1 - p2 <= 0;
+
+    if (t > 0 && t < hit.distance) {
+        hit.distance = t;
+        hit.position = ray.origin + ray.direction * t;
+        hit.normal = inside ? ((light.position - hit.position) / light.radius) : ((hit.position - light.position) / light.radius);
+        hit.emission = light.color * light.intensity;
+        hit.emissive = light.color;
+        return true;
+    }
+    return false;
+}
+
+bool TryIntersection(in Ray ray, inout RayHit hit)
+{
+    bool hitSomething = false;
+
+    for (int i = 0; i < spotLights.length(); i++) {
+        hitSomething = IntersectSpotLight(ray, hit, spotLights[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < planes.length(); i++) {
+        hitSomething = IntersectPlane(ray, hit, planes[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < spheres.length(); i++) {
+        hitSomething = IntersectSphere(ray, hit, spheres[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < boxes.length(); i++) {
+        hitSomething = IntersectBox(ray, hit, boxes[i]) || hitSomething;
+    }
+
+    return hitSomething;
+}
+
+float pow5(float v) {
+    return v * v * v * v * v;
+}
+
+float getReflectance(float i) {
+    return ((i - 1) * (i - 1)) / ((i + 1) * (i + 1));
+}
+
+float F_Schlick(float u, float f0) {
+    return f0 + (1.0 - f0) * pow5(1 - u);
+}
+
+vec3 F_Schlick3(float u, float f0) {
+    return f0 + (vec3(1.0) - f0) * pow5(1 - u);
+}
+
+float D_GGX(float NoH, float a) {
+    float a2 = a * a;
+    float f = (NoH * a2 - NoH) * NoH + 1.0;
+    return a2 / (PI * f * f);
+}
+
+float V_SmithGGXCorrelated(float NoV, float NoL, float a) {
+    float a2 = a * a;
+    float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
+    float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
+    return 0.5 / (GGXV + GGXL);
+}
+
+float Fd_Lambert() {
+    return 1.0 / PI;
+}
+
+void BRDF(vec3 v, vec3 n, vec3 l, float f0, float pRoughness, out vec3 Fr, inout vec3 Fd) {
+    vec3 h = normalize(v + l);
+
+    float NoV = abs(dot(n, v)) + 1e-5;
+    float NoL = clamp(dot(n, l), 0.0, 1.0);
+    float NoH = clamp(dot(n, h), 0.0, 1.0);
+    float LoH = clamp(dot(l, h), 0.0, 1.0);
+
+    // perceptually linear roughness to roughness (see parameterization)
+    float roughness = pRoughness * pRoughness;
+
+    float D = D_GGX(NoH, roughness);
+    vec3  F = F_Schlick3(LoH, f0);
+    float V = V_SmithGGXCorrelated(NoV, NoL, roughness);
+
+    // specular BRDF
+    Fr = (D * V) * F;
+    // diffuse BRDF
+    Fd *= Fd_Lambert();
+}
+
+void performBlinnPhongShading(in Ray ray, in RayHit hit, in vec3 lightDir, in float lightDist, in vec3 lightColor, in float lightIntensity, inout vec3 ambient, inout vec3 diffuseColor, inout vec3 specularColor)
+{
+    float lambertian = max(dot(hit.normal, lightDir), 0.0);
+    float specular = 0.0;
+    
+    if (lambertian > 0.0) { // this is blinn phong
+        vec3 halfDir = normalize(lightDir + -ray.direction);
+        float specAngle = max(dot(halfDir, hit.normal), 0.0);
+        specular = pow(specAngle, hit.shininess);
+    }
+
+    Ray shadowRay = CreateRay(ray.origin + ray.direction * (hit.distance - 0.001), lightDir);
+    RayHit shadowHit = CreateRayHit();
+    if (TryIntersection(shadowRay, shadowHit) && shadowHit.distance < lightDist) {
+        //ambient *= lightColor * lambertian;
+        return;
+    }
+
+    //vec3 diffuse = hit.emission;
+    //vec3 specularC;
+    //BRDF(ray.direction, hit.normal, lightDir, getReflectance(hit.refractionIndex), hit.roughness, specularC, diffuse);
+    //diffuseColor += diffuse * lightColor * lightIntensity / lightDist;
+    //specularColor += specular * specularC * lightColor * lightIntensity / lightDist;
+
+    diffuseColor += lambertian * lightColor * lightIntensity / lightDist;
+    specularColor += specular * lightColor * lightIntensity / lightDist;
+}
+
+vec3 GetLitColor(in Ray ray, in RayHit hit)
+{
+    vec3 ambientColor = vec3(AMBIENT_COLOR);
+    vec3 diffuseColor = vec3(0.0);
+    vec3 specularColor = vec3(0.0);
+
+    for (int i = 0; i < spotLights.length(); ++i) {
+        SpotLight light = spotLights[i];
+        vec3 lightDir = light.position - hit.position;
+        float dist = length(lightDir);
+        lightDir = normalize(lightDir);
+
+        performBlinnPhongShading(ray, hit, lightDir, dist, light.color, light.intensity, ambientColor, diffuseColor, specularColor);
+    }
+
+    for (int i = 0; i < directLights.length(); ++i) {
+        DirectLight light = directLights[i];
+        performBlinnPhongShading(ray, hit, light.direction, 1, light.color, light.intensity, ambientColor, diffuseColor, specularColor);
+    }
+
+    return hit.emission * (ambientColor + diffuseColor) + specularColor;
+}
+
+vec3 GetSkyboxColor(in Ray ray, in vec3 color)
+{
+  vec3 unitDir = ray.direction;
+  vec3 u_SunDir = vec3(0, 1, 0);
+  float sun = 10 * pow(dot(normalize(u_SunDir), unitDir), 400.0);
+  float grad = (unitDir.y + 1.0) * 0.5;
+  vec3 skyboxColor = max(vec3(0.5098, 0.7529, 0.9137) * grad, vec3(sun)) * max(u_SunDir.y, 0.0);
+  return mix(skyboxColor, color, 0);
+}
+
+/*float GetAmbientOcclusion(const in RayHit hit, const in C_Surface surface)
+{
+    #ifdef ENABLE_AMBIENT_OCCLUSION
+    Ray aoRay;
+    RayHit aoHit;
+	float aocc = 1.0;
+    float dist = 0.0;
+
+	for(int i = 0; i < 6; i++) {
+		dist += 0.1;
+	
+		vec4 vSceneDist = GetDistanceScene(vPos + vNormal * fDist, kNoTransparency);
+        aoRay = CreateRay(ray.origin + ray.direction * (hit.distance - 0.001), giDir);
+		aoHit = CreateRayHit();
+        if (TryIntersection(giRay, giHit)) {
+            giShade += dot(hit.normal, giDir) / giHit.distance;
+        }
+	
+		fAmbientOcclusion *= 1.0 - max(0.0, (fDist - vSceneDist.x) * 0.2 / fDist );                                  
+	}
+	
+	return fAmbientOcclusion;
+    #else
+	return 1.0;
+    #endif    
+}*/
+
+void RefractRay(inout Ray ray, in RayHit hit, in float eta) {
+    ray.origin = ray.origin + ray.direction * (hit.distance + 0.01);
+    ray.direction = normalize(refract(ray.direction, hit.normal, eta));
+    ray.inv_dir = 1 / ray.direction;
+}
+
+void ReflectRay(inout Ray ray, in RayHit hit) {
+    ray.origin = ray.origin + ray.direction * (hit.distance - 0.01);
+    ray.direction = normalize(reflect(ray.direction, hit.normal));
+    ray.inv_dir = 1 / ray.direction;
+}
+
+vec3 GetRefractedColor(in Ray ray, in RayHit base, inout RayHit hit) {
+    float r1 = 1.0;
+    float r2 = base.refractionIndex;
+
+    RefractRay(ray, base, r1 / r2);
+    if (TryIntersection(ray, hit)) {
+        RefractRay(ray, hit, r1 / r2);
+        hit = CreateRayHit();
+        if (TryIntersection(ray, hit)){
+            return GetLitColor(ray, hit);
+        } else{
+            return GetSkyboxColor(ray, vec3(0.0));
+        }
+    }
+    
+    return vec3(1.0);
+}
+
+void randomizeNormal(vec3 v, inout vec3 n, float roughness) {
+    //vec3 r = reflect(v, n);
+    vec3 hemi = randomCosineWeightedHemispherePoint(randVec(), n);
+    n = mix(n, normalize(hemi + v), roughness);
+}
+
+vec3 TraceRay(inout Ray ray) {
+    vec3 acc = vec3(0.);
+    float mask = 1.0;
+    RayHit hit;
+
+    float fogDistance = 1000.0;
+    float fogDensity = 0.1;
+    vec3 fogColor = vec3(0.7647, 0.9922, 1.0);
+
+    for (int i = 0; i < MaxBounces; ++i) {
+        hit = CreateRayHit();
+        if (!TryIntersection(ray, hit)) {
+            acc += GetSkyboxColor(ray, acc) * mask;
+            break;
+        }
+        //randomizeNormal(ray.direction, hit.normal, hit.roughness);
+        if (i == 0) fogDistance = hit.distance;
+
+        vec3 passColor = GetLitColor(ray, hit);
+        float f0 = getReflectance(hit.refractionIndex);
+
+        acc += passColor * mask;
+        float fresnel = F_Schlick(dot(ray.direction, hit.normal), getReflectance(hit.refractionIndex));
+        mask *= fresnel * hit.specular;
+
+        if (mask < Epsilon) break;
+
+        ReflectRay(ray, hit);
+    }
+
+    return mix(acc, fogColor, 1.0 - exp2(fogDensity * -0.001 * fogDistance * fogDistance));
+}
+
+float hash1() {
+    return fract(sin(_Seed += 0.1)*43758.5453123);
+}
+
+vec2 hash2() {
+    return fract(sin(vec2(_Seed+=0.1,_Seed+=0.1))*vec2(43758.5453123,22578.1459123));
+}
+
+vec3 hash3() {
+    return fract(sin(vec3(_Seed+=0.1,_Seed+=0.1,_Seed+=0.1))*vec3(43758.5453123,22578.1459123,19642.3490423));
+}
+
+/*vec3 TracePath(in Ray ray) {
+    vec3 acc = vec3(0.0);
+    vec3 emissive = vec3(1.0);
+    float mask = 1.0;
+    RayHit hit;
+
+    for (int i = 0; i < MaxBounces; ++i) {
+        hit = CreateRayHit();
+        if (!TryIntersection(ray, hit)) {
+            emissive += vec3(1.0);
+            return acc;
+            return (acc + GetSkyboxColor(ray, acc) * mask);
+        }
+
+        acc += hit.emission * mask;
+        mask *= Schlick(ray, hit) * hit.specular;
+
+        float specChance = hit.specular;
+		float diffChance = 1.0 - hit.specular;
+
+		// Roulette-select the ray's path
+		float roulette = rand();
+        ray.origin = hit.position + hit.normal * 0.001; 
+
+		//if (roulette < specChance) { // specular
+            vec3 hemi = randomCosineWeightedHemispherePoint(hash3(), hit.normal);
+            ray.direction = hemi;
+        //} else if (diffChance > 0.0 && roulette < specChance + diffChance) {
+            //vec3 hemi = randomHemispherePoint(randVec(), hit.normal);
+            //ray.direction = hemi;
+        //} else {
+            //break;
+        //}
+        
+        ray.inv_dir = 1 / ray.direction;
+    }
+
+    return acc;
+}*/
+
+vec3 reinhard(vec3 color) {
+    return color / (color + 1.0);
+}
+
+void main()
+{
+    float idx = float(gl_GlobalInvocationID.x);
+    float idy = float(gl_GlobalInvocationID.y);
+
+    _Pixel = vec2(idx, idy);
+
+    Ray ray = CreateCameraRay(idx, idy);
+    _Seed = ray.direction.x + fract(ray.direction.y * 18753.43121412313);
+
+    vec3 color = vec3(0.0);
+    uint samples = 1;
+
+    for (int i = 0; i < samples; ++i) {
+        color += TraceRay(ray);
+    }
+
+    color /= samples;
+    //color = vec3(clamp(color.x, 0.0, 1.0), clamp(color.y, 0.0, 1.0), clamp(color.z, 0.0, 1.0));
+    //color = vec3(planes[0].mat.specular);
+    //vec4 old_color = imageLoad(computeImage, ivec2(gl_GlobalInvocationID.xy));
+    //color = mix(old_color.rgb, color, 0.5);
+
+    imageStore(computeImage, ivec2(gl_GlobalInvocationID.xy), vec4(pow(reinhard(color), vec3(1. / GAMMA)), 0.0));
+}

@@ -1,0 +1,984 @@
+#version 450
+//#extension GL_ARB_separate_shader_objects : enable
+//#extension GL_ARB_shading_language_420pack : enable
+//#extension GL_EXT_scalar_block_layout : enable
+
+layout (local_size_x = 8, local_size_y = 8) in;
+layout (binding = 0, rgba16) uniform image2D computeImage;
+
+#define PI 3.141592
+#define INV_PI 0.3183
+#define Inf 1000000.0
+#define Epsilon 0.0001
+
+#define GAMMA 2.2
+#define MaxBounces 5
+#define SHADOW 0.5
+#define MOTION_BLUR 0
+#define AMBIENT_COLOR 0.
+#define ENABLE_AMBIENT_OCCLUSION 1
+
+struct Material
+{
+    vec3 albedo;
+	float metallic;
+    float roughness;
+    float specular;
+    float specTrans;
+    float ior;
+};
+
+struct Plane
+{
+    vec3 position;
+    float pad0;
+    vec3 normal;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+struct Sphere
+{
+    vec3 position;
+    float pad0;
+    vec3 color;
+    float radius;
+    Material mat;
+};
+
+struct Box {
+    vec3 min;
+    float pad0;
+    vec3 max;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+struct DirectLight {
+    vec3 direction;
+    float intensity;
+    vec3 color;
+    float pad0;
+};
+
+struct SpotLight {
+    vec3 position;
+    float intensity;
+    vec3 color;
+    float radius;
+};
+
+layout (binding = 1) buffer SphereBuffer
+{
+    Sphere spheres[];
+};
+
+layout (binding = 2) buffer PlaneBuffer
+{
+    Plane planes[];
+};
+
+layout (binding = 3) buffer BoxBuffer
+{
+    Box boxes[];
+};
+
+layout (binding = 4) buffer SpotLightBuf
+{
+    SpotLight spotLights[];
+};
+
+layout (binding = 5) buffer DirectLightBuf {
+    DirectLight directLights[];
+};
+
+layout (push_constant) uniform CameraSettings
+{
+    vec4 position;
+    vec4 old_position;
+    vec4 forward;
+    vec4 old_forward;
+    vec4 up;
+    float aspectRatio;
+    float focalDistance;
+	int samples;
+    float time;
+} camera;
+
+//////////////////////////////
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+    vec3 inv_dir;
+
+	vec3 energy;
+	vec3 emissive;
+};
+
+struct RayHit
+{
+    vec3 position;
+    float distance;
+    float distanceMax;
+    vec3 normal;
+
+    vec3 emission;
+    vec3 emissive;
+
+    vec3 albedo;
+	float metallic;
+    float roughness;
+    float specular;
+    float specTrans;
+    float ior;
+};
+
+vec2 _Pixel;
+float _Seed;
+
+float hash1() {
+    float result = fract(sin(_Seed / 100.0 * dot(_Pixel, vec2(12.9898, 78.233))) * 43758.5453);
+    _Seed += 1.0;
+    return result;
+}
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = vec3(0.);
+    hit.distance = Inf;
+    hit.normal = vec3(0.);
+
+    hit.emission = vec3(0.);
+	hit.emissive = vec3(0.);
+
+    hit.albedo = vec3(0.);
+    return hit;
+}
+
+Ray CreateRay(in vec3 origin, in vec3 dir) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray.inv_dir = 1 / dir;
+	ray.energy = vec3(1.0);
+	ray.emissive = vec3(0.0);
+    return ray;
+}
+
+Ray CreateCameraRay(in float px, in float py)
+{
+    ivec2 dimensions = imageSize(computeImage);
+    float w = dimensions.x;
+    float h = dimensions.y;
+
+    float i = ((px / w) - 0.5) * camera.focalDistance * camera.aspectRatio;
+    float j = (-(py / h) + 0.5) * camera.focalDistance;
+
+    vec3 right = normalize(cross(camera.old_forward.xyz, camera.up.xyz));
+    vec3 up = cross(right, camera.old_forward.xyz);
+    vec3 oldDir = normalize(camera.old_forward.xyz + (right * i) + (up * j));
+
+    right = normalize(cross(camera.forward.xyz, camera.up.xyz));
+    up = cross(right, camera.forward.xyz);
+    vec3 dir = normalize(camera.forward.xyz + (right * i) + (up * j));
+
+    return CreateRay(camera.position.xyz, dir);
+}
+
+void HitMaterial(inout RayHit hit, in vec3 emission, in Material mat) {
+    hit.emission = emission;
+	//hit.emissive = mat.emissive;
+    hit.albedo = mat.albedo;
+    hit.specular = mat.specular;
+    hit.roughness = mat.roughness;
+	hit.specTrans = mat.specTrans;
+	hit.metallic = mat.metallic;
+    hit.ior = mat.ior;
+}
+
+bool IntersectPlane(in Ray ray, inout RayHit hit, in Plane plane)
+{
+    float d0 = dot(plane.normal, ray.direction);
+    if (d0 != 0)
+    {
+        float t = dot(plane.position - ray.origin, plane.normal) / d0;
+        if (t > Epsilon && t < hit.distance) {
+            hit.distance = hit.distanceMax = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = plane.normal;
+            HitMaterial(hit, plane.color, plane.mat);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IntersectBox(in Ray ray, inout RayHit hit, in Box box)
+{
+    vec3 t1 = ray.inv_dir * (box.min - ray.origin);
+    vec3 t2 = ray.inv_dir * (box.max - ray.origin);
+    vec3 tminv = min(t1, t2);
+    vec3 tmaxv = max(t1, t2);
+
+    float tmin = max(max(tminv.x, 0), max(tminv.y, tminv.z));
+    float tmax = min(tmaxv.x, min(tmaxv.y, tmaxv.z));
+
+    if (tmin <= 0) tmin = tmax;
+
+    if (tmax >= max(tmin, 0.0) && tmin < hit.distance) {
+        hit.distance = tmin;
+        hit.distanceMax = tmax;
+        hit.position = ray.origin + tmin * ray.direction;
+        vec3 norm = -sign(ray.direction) * step(tminv.yzx, tminv.xyz) * step(tminv.zxy, tminv.xyz);
+        hit.normal = norm;
+        HitMaterial(hit, box.color, box.mat);
+        return true;
+    }
+    return false;
+}
+
+bool IntersectSphere(in Ray ray, inout RayHit hit, in Sphere sphere)
+{
+    vec3 d = sphere.position - ray.origin;
+    float p1 = dot(d, ray.direction);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+    if (p2sqr < 0) return false;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    bool inside = p1 - p2 <= 0;
+
+    if (t > 0 && t < hit.distance) {
+        hit.distance = t;
+        hit.distanceMax = p1 > p2 ? p1 + p2 : p1 - p2;
+        hit.position = ray.origin + ray.direction * t;
+        hit.normal = ((hit.position - sphere.position) / sphere.radius);
+        HitMaterial(hit, sphere.color, sphere.mat);
+        return true;
+    }
+    return false;
+}
+
+bool IntersectSpotLight(in Ray ray, inout RayHit hit, in SpotLight light) {
+    vec3 d = light.position - ray.origin;
+    float p1 = dot(d, ray.direction);
+    float p2sqr = p1 * p1 - dot(d, d) + light.radius * light.radius;
+    if (p2sqr < 0) return false;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    bool inside = p1 - p2 <= 0;
+
+    if (t > 0 && t < hit.distance) {
+        hit.distance = t;
+        hit.position = ray.origin + ray.direction * t;
+        hit.normal = inside ? ((light.position - hit.position) / light.radius) : ((hit.position - light.position) / light.radius);
+        hit.emission = light.color * light.intensity;
+        hit.emissive = light.color * light.intensity;
+        return true;
+    }
+    return false;
+}
+
+bool TryIntersection(in Ray ray, inout RayHit hit)
+{
+    bool hitSomething = false;
+
+    for (int i = 0; i < spotLights.length(); i++) {
+        hitSomething = IntersectSpotLight(ray, hit, spotLights[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < planes.length(); i++) {
+        hitSomething = IntersectPlane(ray, hit, planes[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < spheres.length(); i++) {
+        hitSomething = IntersectSphere(ray, hit, spheres[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < boxes.length(); i++) {
+        hitSomething = IntersectBox(ray, hit, boxes[i]) || hitSomething;
+    }
+
+    return hitSomething;
+}
+
+float pow5(float v) {
+    return v * v * v * v * v;
+}
+
+float getReflectance(float i) {
+    return ((i - 1) * (i - 1)) / ((i + 1) * (i + 1));
+}
+
+float F_Schlick(float u, float f0) {
+    return f0 + (1.0 - f0) * pow5(1 - u);
+}
+
+vec3 F_Schlick3(float u, float f0) {
+    return f0 + (vec3(1.0) - f0) * pow5(1 - u);
+}
+
+void RefractRay(inout Ray ray, in RayHit hit, in float eta) {
+    ray.origin = ray.origin + ray.direction * (hit.distance + 0.01);
+    ray.direction = normalize(refract(ray.direction, hit.normal, eta));
+    ray.inv_dir = 1 / ray.direction;
+}
+
+void ReflectRay(inout Ray ray, in RayHit hit) {
+    ray.origin = ray.origin + ray.direction * (hit.distance - 0.01);
+    ray.direction = normalize(reflect(ray.direction, hit.normal));
+    ray.inv_dir = 1 / ray.direction;
+}
+
+vec2 hash2() {
+    return fract(sin(vec2(_Seed+=0.1,_Seed+=0.1))*vec2(43758.5453123,22578.1459123));
+}
+
+vec3 hash3() {
+    return fract(sin(vec3(_Seed+=0.1,_Seed+=0.1,_Seed+=0.1))*vec3(43758.5453123,22578.1459123,19642.3490423));
+}
+
+mat3 GetTangentSpace(vec3 normal)
+{
+    // Choose a helper vector for the cross product
+    vec3 helper = vec3(1, 0, 0);
+    if (abs(normal.x) > 0.99)
+        helper = vec3(0, 0, 1);
+    // Generate vectors
+    vec3 tangent = normalize(cross(normal, helper));
+    vec3 binormal = normalize(cross(normal, tangent));
+    return mat3(tangent, binormal, normal);
+}
+
+vec3 SampleHemisphere(vec3 normal, float alpha) {
+	float cosTheta = pow(hash1(), 1.0 / (alpha + 1.0));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float phi = 2 * PI * hash1();
+    vec3 tangentSpaceDir = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    // Transform direction to world space
+    return GetTangentSpace(normal) * tangentSpaceDir;
+}
+
+float CosinSamplingPDF(float NdotL)
+{
+    return NdotL / PI;
+}
+
+vec3 FresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float nom = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+
+    float nom = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = abs(dot(N, V));
+    float NdotL = abs(dot(N, L));
+    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec3 ImportanceSampleGGX(float x, float y, vec3 N, vec3 V, float roughness)
+{
+    float a = roughness * roughness;
+
+    float phi = 2.0 * PI * x;
+    float cosTheta = sqrt((1.0 - y) / (1.0 + (a * a - 1.0) * y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    // from spherical coordinates to cartesian coordinates
+    vec3 H;
+    H.x = cos(phi) * sinTheta;
+    H.y = sin(phi) * sinTheta;
+    H.z = cosTheta;
+
+    // from tangent-space vector to world-space sample vector
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    vec3 halfVec = tangent * H.x + bitangent * H.y + N * H.z;
+    halfVec = normalize(halfVec);
+    
+    return halfVec;
+
+}
+
+float ImportanceSampleGGX_PDF(float NDF, float NdotH, float VdotH)
+{
+      //ImportanceSampleGGX pdf
+        //pdf = D * NoH / (4 * VoH)
+    return NDF * NdotH / (4 * VdotH);
+   
+}
+
+//calculate fresnel
+float Calculatefresnel(vec3 I, vec3 N, float ior)
+{
+    float kr;
+    float cosi = clamp(-1, 1, dot(I, N));
+    float etai = 1;
+	float etat = ior;
+    if (cosi > 0)
+    {
+        //std::swap(etai, etat);
+        float temp = etai;
+        etai = etat;
+        etat = temp;
+    }
+    // Compute sini using Snell's law
+    float sint = etai / etat * sqrt(max(0.f, 1 - cosi * cosi));
+    // Total internal reflection
+    if (sint >= 1)
+    {
+        kr = 1;
+    }
+    else
+    {
+        float cost = sqrt(max(0.f, 1 - sint * sint));
+        cosi = abs(cosi);
+        float Rs = ((etat * cosi) - (etai * cost)) / ((etat * cosi) + (etai * cost));
+        float Rp = ((etai * cosi) - (etat * cost)) / ((etai * cosi) + (etat * cost));
+        kr = (Rs * Rs + Rp * Rp) / 2;
+    }
+    return kr;
+    // As a consequence of the conservation of energy, transmittance is given by:
+    // kt = 1 - kr;
+}
+
+vec3 RefractionBTDF(float D, float G, vec3 F, vec3 V, vec3 L, vec3 N, vec3 H, float etaIn, float etaOut)
+{ //Not reciprocal! be careful about direction!
+    
+    float NdotL = abs(dot(N, L));
+    float NdotV = abs(dot(N, V));
+            
+    float VdotH = abs(dot(V, H));
+    float LdotH = abs(dot(L, H));
+            
+    
+    float term1 = VdotH * LdotH / (NdotV * NdotL);
+    vec3 term2 = etaOut * etaOut * (1 - F) * G * D;
+            //term1 = 1;
+            //term2 = 1;
+    float term3 = (etaIn * VdotH + etaOut * LdotH) * (etaIn * VdotH + etaOut * LdotH) + 0.001f;
+            //term3 = 1;
+    vec3 refractionBrdf = term1 * term2 / term3;
+    
+    return refractionBrdf;
+}
+
+vec3 SpecularBRDF(float D, float G, vec3 F, vec3 V, vec3 L, vec3 N)
+{        
+    float NdotL = abs(dot(N, L));
+    float NdotV = abs(dot(N, V));
+            
+    //specualr
+    //Microfacet specular = D * G * F / (4 * NoL * NoV)
+    vec3 nominator = D * G * F;
+    float denominator = 4.0 * NdotV * NdotL + 0.001;
+    vec3 specularBrdf = nominator / denominator;
+    
+    return specularBrdf;
+}
+
+vec3 DiffuseBRDF(vec3 albedo)
+{
+    return albedo / PI;
+}
+
+vec3 TraceRay(inout Ray ray) {
+    vec3 acc = vec3(0.);
+	vec3 light = vec3(0.);
+    RayHit hit;
+	float energy = 1.0;
+
+    for (int i = 0; i < 3; ++i) {
+        hit = CreateRayHit();
+        if (!TryIntersection(ray, hit)) {
+			acc += vec3(0.4314, 0.8314, 0.9333);
+			light += vec3(0.6824, 0.9686, 0.9804);
+            break;
+        }
+
+		//float f = dot(ray.direction, lightVec);
+		vec3 hemi = SampleHemisphere(normalize(reflect(ray.direction, hit.normal)), 1.0);
+
+		if (hit.emissive.x > 0) {
+			//energy *= 2;
+		}
+        acc += energy * hit.emission;
+		light += hit.emissive;
+		energy *= hash1() * hit.specular;
+
+		ray.origin = hit.position + hit.normal * 0.001;
+		ray.direction = hemi;
+		ray.inv_dir = 1 / hemi;
+    }
+
+	return acc * light;
+}
+
+vec3 reinhard(vec3 color) {
+    return color / (color + 1.0);
+}
+
+/*vec3 Shade(inout Ray ray)
+{
+	RayHit hit = CreateRayHit();
+    if (TryIntersection(ray, hit))
+    {
+        float roulette = hash1();
+        float blender = hash1();//used to blend BSDF and BRDF
+        
+        if (blender < 1 - hit.specTrans)
+        {
+            vec3 reflectionDir;
+            
+            float diffuseRatio = 0.5 * (1.0 - hit.metallic);
+            float specularRoatio = 1 - diffuseRatio;
+            vec3 V = normalize(-ray.direction);
+            
+            if (roulette < diffuseRatio)
+            { //sample diffuse
+            
+            //cosin sample
+                reflectionDir = SampleHemisphere(hit.normal, 1.0);
+            }
+            else
+            { //sample specular
+            
+            
+            //hemisphere sampling
+            //reflectionDir = SampleHemisphere(hit.normal, 0.0f);
+
+            //ImportanceSampleGGX
+                vec3 halfVec = ImportanceSampleGGX(hash1(), hash1(), hit.normal, V, hit.roughness);
+                //isosceles
+                reflectionDir = 2.0 * dot(V, halfVec) * halfVec - V;
+                reflectionDir = normalize(reflectionDir);
+            }
+            
+            vec3 L = normalize(reflectionDir);
+            vec3 H = normalize(V + L);
+        
+            float NdotL = abs(dot(hit.normal, L));
+            float NdotH = abs(dot(hit.normal, H));
+            float VdotH = abs(dot(V, H));
+            
+            float NdotV = abs(dot(hit.normal, V));
+            
+            vec3 F0 = vec3(0.08, 0.08, 0.08);
+            F0 = mix(F0 * hit.specular, hit.albedo, hit.metallic);
+        
+            float NDF = DistributionGGX(hit.normal, H, hit.roughness);
+            float G = GeometrySmith(hit.normal, V, L, hit.roughness);
+            vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+        
+            vec3 kS = F;
+            vec3 kD = 1.0 - kS;
+            kD *= 1.0 - hit.metallic;
+        
+            vec3 specularBrdf = SpecularBRDF(NDF, G, F, V, L, hit.normal);
+        
+        //hemisphere sampling pdf
+        //pdf = 1 / (2 * PI)
+        //float speccualrPdf = 1 / (2 * PI);
+        
+        //ImportanceSampleGGX pdf
+        //pdf = D * NoH / (4 * VoH)
+            float speccualrPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+        
+
+        
+        //diffuse
+        //Lambert diffuse = diffuse / PI
+            vec3 diffuseBrdf = DiffuseBRDF(hit.albedo);
+        //cosin sample pdf = N dot L / PI
+            float diffusePdf = CosinSamplingPDF(NdotL);
+
+            vec3 totalBrdf = (diffuseBrdf * kD + specularBrdf) * NdotL;
+            float totalPdf = diffuseRatio * diffusePdf + specularRoatio * speccualrPdf;
+                
+            ray.origin = hit.position + hit.normal * 0.001;
+            ray.direction = reflectionDir;
+			ray.inv_dir = 1 / reflectionDir;
+            if (totalPdf > 0.0)
+            {
+                ray.energy *= totalBrdf / totalPdf;
+            }
+        }
+        else
+        {
+            bool fromOutside = dot(ray.direction, hit.normal) < 0;
+            vec3 N = fromOutside ? hit.normal : -hit.normal;
+            vec3 bias = N * 0.001f;
+            
+            float etai = 1;
+            float etat = 1.55;
+            
+            vec3 V = normalize(-ray.direction);
+            vec3 H = ImportanceSampleGGX(hash1(), hash1(), N, V, hit.roughness);
+            
+            
+            vec3 F0 = vec3(0.08, 0.08, 0.08);
+            F0 = F0 * hit.specular;
+            vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+            
+            
+            float kr = Calculatefresnel(ray.direction, hit.normal, 1.55);
+            
+            float specularRoatio = kr;
+            float refractionRatio = 1 - kr;
+            
+            vec3 L;
+            
+            if (roulette <= specularRoatio)
+            {
+                ray.origin = hit.position + bias;
+                L = reflect(ray.direction, H);
+                ray.direction = L;
+            }
+            else
+            {
+                float eta = fromOutside ? etai / etat : etat / etai;
+                L = normalize(refract(ray.direction, H, eta));
+                ray.origin = hit.position - bias;
+                ray.direction = L;
+				ray.inv_dir = 1 / L;
+                //L = N;
+                if (!fromOutside)
+                {
+                        //since the BTDF is not reciprocal, we need to invert the direction of our vectors.
+                    vec3 temp = L;
+                    L = V;
+                    V = temp;
+                        
+                    N = -N;
+                    H = -H;
+                }
+            }
+            
+            float NdotL = abs(dot(N, L));
+            float NdotV = abs(dot(N, V));
+            
+            float NdotH = abs(dot(N, H));
+            float VdotH = abs(dot(V, H));
+            float LdotH = abs(dot(L, H));
+            
+            
+            float NDF = DistributionGGX(N, H, hit.roughness);
+            float G = GeometrySmith(N, V, L, hit.roughness);
+            
+             //specualr
+   
+            vec3 specularBrdf = SpecularBRDF(NDF, G, F, V, L, N);
+            
+            //ImportanceSampleGGX pdf
+            //pdf = D * NoH / (4 * VoH)
+            float speccualrPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+            
+            //refraction
+            float etaOut = etat;
+            float etaIn = etai;
+            
+            vec3 refractionBtdf = RefractionBTDF(NDF, G, F, V, L, N, H, etaIn, etaOut);
+            float refractionPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+            
+            //BSDF = BRDF + BTDF
+            vec3 totalBrdf = (specularBrdf + refractionBtdf * hit.emission) * NdotL;
+            float totalPdf = specularRoatio * speccualrPdf + refractionRatio * refractionPdf;
+            if (totalPdf > 0.0)
+            {
+                ray.energy *= totalBrdf / totalPdf;
+            }
+        }
+      
+        
+        return hit.emission;
+    }
+    else
+    {
+        // Erase the ray's energy - the sky doesn't reflect anything
+        ray.energy = vec3(0.0);
+		return vec3(0.6667, 0.9804, 0.9804);
+        // Sample the skybox and write it
+        //float theta = acos(ray.direction.y) / -PI;
+        //float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+        //return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+    }
+}*/
+
+vec3 Shade(inout Ray ray)
+{
+	RayHit hit = CreateRayHit();
+    if (TryIntersection(ray, hit))
+    {
+        float roulette = hash1();
+        float blender = hash1();//used to blend BSDF and BRDF
+        
+        if (blender <= 1.0)
+        {
+            vec3 reflectionDir;
+            
+            float diffuseRatio = 0.5 * (1.0 - hit.metallic);
+            float specularRoatio = 1 - diffuseRatio;
+            vec3 V = normalize(-ray.direction);
+            
+            if (roulette < diffuseRatio) {
+                reflectionDir = SampleHemisphere(hit.normal, 1.0);
+            } else {
+            	//hemisphere sampling
+            	//reflectionDir = SampleHemisphere(hit.normal, 0.0f);
+
+            	//ImportanceSampleGGX
+            	vec3 halfVec = ImportanceSampleGGX(hash1(), hash1(), hit.normal, V, hit.roughness);
+                reflectionDir = reflect(ray.direction, halfVec);//2.0 * dot(V, halfVec) * halfVec - V;
+                reflectionDir = normalize(reflectionDir);
+            }
+            vec3 L = normalize(reflectionDir);
+            vec3 H = normalize(V + L);
+        
+            float NdotL = abs(dot(hit.normal, L));
+            float NdotH = abs(dot(hit.normal, H));
+            float VdotH = abs(dot(V, H));
+            
+            float NdotV = abs(dot(hit.normal, V));
+            
+            vec3 F0 = vec3(0.08, 0.08, 0.08);
+            F0 = mix(F0 * hit.specular, hit.albedo, hit.metallic);
+        
+            float NDF = DistributionGGX(hit.normal, H, hit.roughness);
+            float G = GeometrySmith(hit.normal, V, L, hit.roughness);
+            vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+        
+            vec3 kS = F;
+            vec3 kD = 1.0 - kS;
+            kD *= 1.0 - hit.metallic;
+        
+            vec3 specularBrdf = SpecularBRDF(NDF, G, F, V, L, hit.normal);
+        
+        //hemisphere sampling pdf
+        //pdf = 1 / (2 * PI)
+        //float speccualrPdf = 1 / (2 * PI);
+        
+        //ImportanceSampleGGX pdf
+        //pdf = D * NoH / (4 * VoH)
+            float speccualrPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+        
+
+        
+        //diffuse
+        //Lambert diffuse = diffuse / PI
+            vec3 diffuseBrdf = DiffuseBRDF(hit.albedo);
+        //cosin sample pdf = N dot L / PI
+            float diffusePdf = CosinSamplingPDF(NdotL);
+
+            vec3 totalBrdf = (diffuseBrdf * kD + specularBrdf) * NdotL;
+            float totalPdf = diffuseRatio * diffusePdf + specularRoatio * speccualrPdf;
+                
+            ray.origin = hit.position + hit.normal * 0.001;
+            ray.direction = reflectionDir;
+			ray.inv_dir = 1 / reflectionDir;
+            if (totalPdf > 0.0)
+            {
+                ray.energy *= totalBrdf / totalPdf;
+            }
+			ray.emissive += hit.emissive;
+        }
+        else
+        {
+            bool fromOutside = dot(ray.direction, hit.normal) < 0;
+            vec3 N = fromOutside ? hit.normal : -hit.normal;
+            vec3 bias = N * 0.001f;
+            
+            float etai = 1;
+            float etat = 1.55;
+            
+            vec3 V = normalize(-ray.direction);
+            vec3 H = ImportanceSampleGGX(hash1(), hash1(), N, V, hit.roughness);
+            
+            
+            vec3 F0 = vec3(0.08, 0.08, 0.08);
+            F0 = F0 * hit.specular;
+            vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
+            
+            
+            float kr = Calculatefresnel(ray.direction, hit.normal, 1.55);
+            
+            float specularRoatio = kr;
+            float refractionRatio = 1 - kr;
+            
+            vec3 L;
+            
+            if (roulette <= specularRoatio)
+            {
+                ray.origin = hit.position + bias;
+                L = reflect(ray.direction, H);
+                ray.direction = L;
+            }
+            else
+            {
+                float eta = fromOutside ? etai / etat : etat / etai;
+                L = normalize(refract(ray.direction, H, eta));
+                ray.origin = hit.position - bias;
+                ray.direction = L;
+				ray.inv_dir = 1 / L;
+                //L = N;
+                if (!fromOutside)
+                {
+                        //since the BTDF is not reciprocal, we need to invert the direction of our vectors.
+                    vec3 temp = L;
+                    L = V;
+                    V = temp;
+                        
+                    N = -N;
+                    H = -H;
+                }
+            }
+            
+            float NdotL = abs(dot(N, L));
+            float NdotV = abs(dot(N, V));
+            
+            float NdotH = abs(dot(N, H));
+            float VdotH = abs(dot(V, H));
+            float LdotH = abs(dot(L, H));
+            
+            
+            float NDF = DistributionGGX(N, H, hit.roughness);
+            float G = GeometrySmith(N, V, L, hit.roughness);
+            
+             //specualr
+   
+            vec3 specularBrdf = SpecularBRDF(NDF, G, F, V, L, N);
+            
+            //ImportanceSampleGGX pdf
+            //pdf = D * NoH / (4 * VoH)
+            float speccualrPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+            
+            //refraction
+            float etaOut = etat;
+            float etaIn = etai;
+            
+            vec3 refractionBtdf = RefractionBTDF(NDF, G, F, V, L, N, H, etaIn, etaOut);
+            float refractionPdf = ImportanceSampleGGX_PDF(NDF, NdotH, VdotH);
+            
+            //BSDF = BRDF + BTDF
+            vec3 totalBrdf = (specularBrdf + refractionBtdf * hit.emission) * NdotL;
+            float totalPdf = specularRoatio * speccualrPdf + refractionRatio * refractionPdf;
+            if (totalPdf > 0.0)
+            {
+                ray.energy *= totalBrdf / totalPdf;
+            }
+        }
+
+        return hit.emission;
+    } else {
+        ray.energy = vec3(0.0, 0.0, 0.0);
+		ray.emissive += vec3(1.0, 1.0, 1.0);
+		return vec3(1.0, 1.0, 1.0);
+    }
+}
+
+vec3 TracePath(inout Ray ray) {
+	RayHit hit;
+	vec3 prev = vec3(1.);
+	vec3 acc = vec3(0.);
+
+	for (int i = 0; i < 4; ++i) {
+		hit = CreateRayHit();
+  		if (!TryIntersection(ray, hit)) {
+			ray.energy = vec3(0.);
+    		return acc + vec3(0.698, 0.9686, 0.9294) * prev;  // Nothing was hit.
+  		}
+
+  		// Pick a random direction from here and keep going.
+  		ray.origin = hit.position + hit.normal * 0.001;
+  		// This is NOT a cosine-weighted distribution!
+  		ray.direction = SampleHemisphere(hit.normal, 1.0);
+
+  		// Probability of the newRay
+  		const float p = 1 / (2 * PI);
+  		// Compute the BRDF for this ray (assuming Lambertian reflection)
+  		float cos_theta = dot(ray.direction, hit.normal);
+  		vec3 BRDF = hit.albedo / PI;
+
+  		// Apply the Rendering Equation here.
+  		acc += hit.emission * prev;
+		prev = BRDF * cos_theta / p;
+	}
+	return acc;
+}
+
+void main()
+{
+    float idx = float(gl_GlobalInvocationID.x);
+    float idy = float(gl_GlobalInvocationID.y);
+
+    _Pixel = vec2(idx, idy);
+
+    Ray ray = CreateCameraRay(idx, idy);
+    _Seed = ray.direction.x + fract(ray.direction.y * 18753.43121412313) * camera.time;
+
+    vec3 color = vec3(0.0);
+    //uint samples = 8;
+
+	for (int j = 0; j < camera.samples; ++j) {
+		vec3 acc = vec3(0.);
+    	for (int i = 0; i < 4; ++i) {
+        	acc += ray.energy * Shade(ray);
+			if ((ray.energy.x + ray.energy.y + ray.energy.z) <= 0.0) {
+				break;
+			}
+		}
+		color += acc * ray.emissive;
+		// color += TracePath(ray);
+		// ray = CreateCameraRay(idx, idy);
+    }
+
+    color /= camera.samples;
+	/*int radius = 3;
+	int a = 0;
+	vec4 tempo = vec4(0.);
+	for (int i = -radius; i < radius; ++i) {
+		for (int j = -radius; j < radius; ++j) {
+			tempo += imageLoad(computeImage, ivec2(gl_GlobalInvocationID.x + i, gl_GlobalInvocationID.y + j));
+			a++;
+		}
+	}
+	tempo /= a;*/
+    vec4 real = vec4(pow(reinhard(color), vec3(1. / GAMMA)), 0.0);
+	imageStore(computeImage, ivec2(gl_GlobalInvocationID.xy), real);
+}

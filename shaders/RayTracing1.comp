@@ -1,0 +1,392 @@
+#version 450
+//#extension GL_ARB_separate_shader_objects : enable
+//#extension GL_ARB_shading_language_420pack : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+layout (local_size_x = 8, local_size_y = 4) in;
+layout (binding = 0, rgba8) uniform image2D computeImage;
+
+#define PI 3.141592
+#define Inf 1000000.0
+#define Epsilon 0.0001
+
+#define MaxBounces 4
+#define SHADOW 0.1
+
+struct Sphere
+{
+	vec3 position;
+	vec3 albedo;
+	vec3 specular;
+	vec3 emission;
+	float radius;
+	float smoothness;
+	float pad0;
+};
+
+struct Plane
+{
+	vec3 normal;
+	float leng;
+};
+
+layout (binding = 1) buffer SphereBuffer
+{
+	Sphere spheres[];
+};
+
+layout (binding = 2) buffer PlaneBuffer
+{
+	Plane planes[];
+};
+
+layout (push_constant) uniform CameraSettings
+{
+    vec4 position;
+    vec4 forward;
+    vec4 up;
+    float aspectRatio;
+	float fov;
+    float _padding[2];
+} camera;
+
+//////////////////////////////
+
+float sdot(in vec3 x, in vec3 y, in float f)
+{
+	return clamp(dot(x, y) * f, 0, 1);
+}
+
+float energy(in vec3 color)
+{
+	return dot(color, vec3(1.0f / 3.0f));
+}
+
+//-------------------------------------
+//- RANDOMNESS
+vec2 _Pixel;
+float _Seed;
+
+/*float PHI = 1.61803398874989484820459;  // Φ = Golden Ratio
+
+float rand(){
+	return fract(tan(distance(_Pixel * PHI, _Pixel) * _Seed) * _Pixel.x);
+}*/
+
+vec3 randVec() {
+	return vec3(rand(), rand(), rand());
+}
+
+float rand() {
+	float result = fract(sin(_Seed / 100.0f * dot(_Pixel, vec2(12.9898f, 78.233f))) * 43758.5453f);
+	_Seed += 1.0f;
+	return result;
+}
+
+vec3 randomSpherePoint(vec3 rand) {
+	float ang1 = (rand.x + 1.0) * PI; // [-1..1) -> [0..2*PI)
+	float u = rand.y; // [-1..1), cos and acos(2v-1) cancel each other out, so we arrive at [-1..1)
+	float u2 = u * u;
+	float sqrt1MinusU2 = sqrt(1.0 - u2);
+	float x = sqrt1MinusU2 * cos(ang1);
+	float y = sqrt1MinusU2 * sin(ang1);
+	float z = u;
+	return vec3(x, y, z);
+}
+
+vec3 randomHemispherePoint(vec3 rand, vec3 n) {
+	/**
+     * Generate random sphere point and swap vector along the normal, if it
+     * points to the wrong of the two hemispheres.
+     * This method provides a uniform distribution over the hemisphere,
+     * provided that the sphere distribution is also uniform.
+     */
+	vec3 v = randomSpherePoint(rand);
+	return v * sign(dot(v, n));
+}
+
+vec3 randomCosineWeightedHemispherePoint(vec3 rand, vec3 n) {
+	float r = rand.x * 0.5 + 0.5; // [-1..1) -> [0..1)
+	float angle = (rand.y + 1.0) * PI; // [-1..1] -> [0..2*PI)
+	float sr = sqrt(r);
+	vec2 p = vec2(sr * cos(angle), sr * sin(angle));
+	/*
+     * Unproject disk point up onto hemisphere:
+     * 1.0 == sqrt(x*x + y*y + z*z) -> z = sqrt(1.0 - x*x - y*y)
+     */
+	vec3 ph = vec3(p.xy, sqrt(1.0 - p*p));
+	/*
+     * Compute some arbitrary tangent space for orienting
+     * our hemisphere 'ph' around the normal. We use the camera's up vector
+     * to have some fix reference vector over the whole screen.
+     */
+	vec3 tangent = normalize(rand);
+	vec3 bitangent = cross(tangent, n);
+	tangent = cross(bitangent, n);
+
+	/* Make our hemisphere orient around the normal. */
+	return tangent * ph.x + bitangent * ph.y + n * ph.z;
+}
+
+struct Ray
+{
+	vec3 origin;
+	vec3 direction;
+	vec3 energy;
+};
+
+Ray CreateRay(vec3 origin, vec3 direction)
+{
+	Ray ray;
+	ray.origin = origin;
+	ray.direction = direction;
+	ray.energy = vec3(1.0);
+	return ray;
+}
+
+Ray CreateCameraRay(in uint px, in uint py)
+{
+	ivec2 dimensions = imageSize(computeImage);
+	float w = dimensions.x;
+	float h = dimensions.y;
+
+	float fovX = camera.fov * 0.5;
+	float fovY = (h / w) * fovX;
+
+	float i = ((px / w) - 0.5) * tan(fovX);
+	float j = (-(py / h) + 0.5) * tan(fovY);
+
+	vec3 right = normalize(cross(camera.forward.xyz, camera.up.xyz));
+	vec3 up = cross(right, camera.forward.xyz);
+
+	vec3 target = camera.forward.xyz + (right * i) + (up * j);
+
+	return CreateRay(camera.position.xyz, normalize(target));
+}
+
+//-------------------------------------
+//- RAYHIT
+
+struct RayHit
+{
+	vec3 position;
+	float distance;
+	vec3 normal;
+	vec3 albedo;
+	vec3 specular;
+	float smoothness;
+	vec3 emission;
+};
+
+RayHit CreateRayHit()
+{
+	RayHit hit;
+	hit.position = vec3(0.0f, 0.0f, 0.0f);
+	hit.distance = Inf;
+	hit.normal = vec3(0.0f, 0.0f, 0.0f);
+	hit.albedo = vec3(0.0f, 0.0f, 0.0f);
+	hit.specular = vec3(0.0f, 0.0f, 0.0f);
+	hit.smoothness = 0.0f;
+	hit.emission = vec3(0.0f, 0.0f, 0.0f);
+	return hit;
+}
+
+
+//-------------------------------------
+//- INTERSECTION
+
+void IntersectGroundPlane(in Ray ray, inout RayHit bestHit)
+{
+	// Calculate distance along the ray where the ground plane is intersected
+	//float t = -ray.origin.y / ray.direction.y;
+	Plane plane = planes[0];
+
+	float d0 = dot(plane.normal, ray.direction);
+	if (d0 != 0)
+	{
+		float t = -1 * (((dot(plane.normal, ray.origin)) + plane.leng) / d0);
+		if (t > 0 && t < bestHit.distance)
+		{
+			bestHit.distance = t;
+			bestHit.position = ray.origin + t * ray.direction;
+			bestHit.normal = vec3(0.0f, 1.0f, 0.0f);
+			bestHit.albedo = vec3(1.0);
+			bestHit.specular = vec3(0);
+			bestHit.smoothness = 1.0f;
+			bestHit.emission = vec3(0.007, 0.580, 0.8);
+		}
+	}
+}
+
+void IntersectSphere(in Ray ray, inout int rayCount, inout RayHit bestHit, in Sphere sphere)
+{
+	// Calculate distance along the ray where the sphere is intersected
+
+	/*vec3 delta = ray.origin - sphere.position;
+	float b = dot((delta * 2), ray.direction);
+	float c = dot(delta, delta) - (sphere.radius * sphere.radius);
+
+	float disc = b * b - 4 * c;
+	if (disc < 0) return;
+	else disc = sqrt(disc);
+
+	// Always 2 solutions when pulling the square root.
+	float result1 = -b + disc;
+	float result2 = -b - disc;
+
+	float t = (result2 > Epsilon) ? result2 / 2 : ((result1 > Epsilon) ? result1 / 2 : 0);*/
+	vec3 d = ray.origin - sphere.position;
+	float p1 = -dot(ray.direction, d);
+	float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+	if (p2sqr < 0) return;
+
+	float p2 = sqrt(p2sqr);
+	float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+
+	++rayCount;
+
+	if (t > 0 && t < bestHit.distance)
+	{
+		bestHit.distance = t;
+		bestHit.position = ray.origin + t * ray.direction;
+		bestHit.normal = normalize(bestHit.position - sphere.position);
+		bestHit.albedo = vec3(1.0);//sphere.albedo;
+		bestHit.specular = vec3(0);//sphere.specular;
+		bestHit.smoothness = 1.0;//sphere.smoothness;
+		bestHit.emission = vec3(1.0);//sphere.emission;
+	}
+}
+
+//-------------------------------------
+//- TRACE
+
+RayHit Trace(in Ray ray, inout int rayCount)
+{
+	RayHit bestHit = CreateRayHit();
+
+	++rayCount;
+
+	// Trace ground plane
+	IntersectGroundPlane(ray, bestHit);
+
+	// Trace spheres
+	for (int i = 0; i < spheres.length(); i++)
+	{
+		IntersectSphere(ray, rayCount, bestHit, spheres[i]);
+	}
+
+	return bestHit;
+}
+
+//-------------------------------------
+//- SAMPLING
+
+/*mat3 GetTangentSpace(in vec3 normal)
+{
+	// Choose a helper vector for the cross product
+	vec3 helper = vec3(1, 0, 0);
+	if (abs(normal.x) > 0.99f) helper = vec3(0, 0, 1);
+
+	// Generate vectors
+	vec3 tangent = normalize(cross(normal, helper));
+	vec3 binormal = normalize(cross(normal, tangent));
+	return mat3(tangent, binormal, normal);
+}
+
+vec3 SampleHemisphere(in vec3 normal, in float alpha)
+{
+	// Sample the hemisphere, where alpha determines the kind of the sampling
+	float cosTheta = pow(rand(), 1.0f / (alpha + 1.0f));
+	float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+	float phi = 2 * PI * rand();
+	vec3 tangentSpaceDir = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+	// Transform direction to world space
+	//return normal;
+	return tangentSpaceDir * GetTangentSpace(normal);
+}*/
+
+vec3 RandomUnitVectorHemisphere(vec3 normal)  {
+	return randomHemispherePoint(rand(), normal);
+}
+
+//-------------------------------------
+//- SHADE
+
+float SmoothnessToPhongAlpha(in float s)
+{
+	return pow(1000.0f, s * s);
+}
+
+vec3 Shade(inout Ray ray, inout RayHit hit)
+{
+	if (hit.distance < Inf)
+	{
+		// Calculate chances of diffuse and specular reflection
+		hit.albedo = min(1.0f - hit.specular, hit.albedo);
+		float specChance = energy(hit.specular);
+		float diffChance = energy(hit.albedo);
+
+		// Roulette-select the ray's path
+		float roulette = rand();
+		if (roulette < specChance)
+		{
+			// Specular reflection
+			ray.origin = hit.position + hit.normal * 0.001f;
+			float alpha = SmoothnessToPhongAlpha(hit.smoothness);
+			ray.direction = SampleHemisphere(reflect(ray.direction, hit.normal), alpha);
+			float f = (alpha + 2) / (alpha + 1);
+			ray.energy *= (1.0f / specChance) * hit.specular * sdot(hit.normal, ray.direction, f);
+		}
+		else if (diffChance > 0 && roulette < specChance + diffChance)
+		{
+			// Diffuse reflection
+			ray.origin = hit.position + hit.normal * 0.001f;
+			ray.direction = SampleHemisphere(hit.normal, 1.0f);
+			ray.energy *= (1.0f / diffChance) * hit.albedo;
+		}
+		else
+		{
+			// Terminate ray
+			ray.energy = vec3(0.0f);
+		}
+
+		return hit.emission;
+	}
+	else
+	{
+		// Erase the ray's energy - the sky doesn't reflect anything
+		ray.energy = vec3(0.0f);
+		return vec3(0.0);
+		// Sample the skybox and write it
+		//float theta = acos(ray.direction.y) / -PI;
+		//float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+		//return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+	}
+}
+
+void main()
+{
+	uint idx = gl_GlobalInvocationID.x;
+	uint idy = gl_GlobalInvocationID.y;
+
+	_Pixel = vec2(idx, idy);
+	_Seed = gl_GlobalInvocationID.x;
+
+	Ray ray;
+	ray = CreateCameraRay(idx, idy);
+
+	int rayCount = 0;
+	vec3 result = vec3(0.0);
+	for (int i = 0; i < 8; i++)
+	{
+		RayHit hit = Trace(ray, rayCount);
+		result += ray.energy * Shade(ray, hit);
+
+		if (ray.energy.x == 0 && ray.energy.y == 0 && ray.energy.z == 0) break;
+	}
+	//result /= 8;
+	result = vec3(clamp(result.x, 0.0, 1.0), clamp(result.y, 0.0, 1.0), clamp(result.z, 0.0, 1.0));
+
+	imageStore(computeImage, ivec2(gl_GlobalInvocationID.xy), vec4(result, 0.0));
+}

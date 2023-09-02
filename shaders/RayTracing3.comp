@@ -1,0 +1,436 @@
+#version 450
+//#extension GL_ARB_separate_shader_objects : enable
+//#extension GL_ARB_shading_language_420pack : enable
+//#extension GL_EXT_scalar_block_layout : enable
+
+layout (local_size_x = 8, local_size_y = 8) in;
+layout (binding = 0, rgba8) uniform image2D computeImage;
+
+#define PI 3.141592
+#define Inf 1000000.0
+#define Epsilon 0.0001
+
+#define GAMMA 2.2
+#define MaxBounces 3
+#define SHADOW 0.5
+
+struct Material
+{
+    float diffuse;
+    float specular;
+    float shininess;
+    float ambience;
+};
+
+struct Plane
+{
+    vec3 position;
+    float pad0;
+    vec3 normal;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+struct Sphere
+{
+    vec3 position;
+    float pad0;
+    vec3 color;
+    float radius;
+    Material mat;
+};
+
+struct Box {
+    vec3 min;
+    float pad0;
+    vec3 max;
+    float pad1;
+    vec3 color;
+    float pad2;
+    Material mat;
+};
+
+layout (binding = 1) buffer SphereBuffer
+{
+    Sphere spheres[];
+};
+
+layout (binding = 2) buffer PlaneBuffer
+{
+    Plane planes[];
+};
+
+layout (binding = 3) buffer BoxBuffer
+{
+    Box boxes[];
+};
+
+layout (binding = 4) uniform Env
+{
+    vec3 lightPos;
+    float lightIntensity;
+} env;
+
+layout (push_constant) uniform CameraSettings
+{
+    vec4 position;
+    vec4 forward;
+    vec4 up;
+    float aspectRatio;
+    float focalDistance;
+    float _padding[2];
+} camera;
+
+//////////////////////////////
+
+struct Ray
+{
+    vec3 origin;
+    vec3 direction;
+    vec3 inv_dir;
+};
+
+struct RayHit
+{
+    vec3 position;
+    float distance;
+    vec3 normal;
+
+    vec3 emission;
+
+    float diffuse;
+    float specular;
+    float shininess;
+    float ambience;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = vec3(0.);
+    hit.distance = Inf;
+    hit.normal = vec3(0.);
+
+    hit.emission = vec3(0.);
+
+    hit.diffuse = 0;
+    hit.specular = 0;
+    hit.shininess = 0;
+    hit.ambience = 0;
+    return hit;
+}
+
+Ray CreateRay(in vec3 origin, in vec3 dir) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray.inv_dir = 1 / dir;
+    return ray;
+}
+
+Ray CreateCameraRay(in uint px, in uint py)
+{
+    ivec2 dimensions = imageSize(computeImage);
+    float w = dimensions.x;
+    float h = dimensions.y;
+
+    float i = ((px / w) - 0.5) * camera.focalDistance * camera.aspectRatio;
+    float j = (-(py / h) + 0.5) * camera.focalDistance;
+
+    vec3 right = normalize(cross(camera.forward.xyz, camera.up.xyz));
+    vec3 up = cross(right, camera.forward.xyz);
+
+    vec3 target = camera.forward.xyz + (right * i) + (up * j);
+    return CreateRay(camera.position.xyz, normalize(target));
+}
+
+vec2 _Pixel;
+float _Seed;
+
+float PHI = 1.61803398874989484820459;// Φ = Golden Ratio
+
+/*float rand(){
+    _Seed += 1;
+	return fract(tan(distance(_Pixel * PHI, _Pixel) * _Seed) * _Pixel.x);
+}*/
+
+float rand() {
+    float result = fract(sin(_Seed / 100.0f * dot(_Pixel, vec2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+vec3 randVec() {
+    return vec3(rand(), rand(), rand());
+}
+
+vec3 randomSpherePoint(vec3 rand) {
+    float ang1 = (rand.x + 1.0) * PI;// [-1..1) -> [0..2*PI)
+    float u = rand.y;// [-1..1), cos and acos(2v-1) cancel each other out, so we arrive at [-1..1)
+    float u2 = u * u;
+    float sqrt1MinusU2 = sqrt(1.0 - u2);
+    float x = sqrt1MinusU2 * cos(ang1);
+    float y = sqrt1MinusU2 * sin(ang1);
+    float z = u;
+    return vec3(x, y, z);
+}
+
+vec3 randomHemispherePoint(vec3 rand, vec3 n) {
+    /**
+     * Generate random sphere point and swap vector along the normal, if it
+     * points to the wrong of the two hemispheres.
+     * This method provides a uniform distribution over the hemisphere,
+     * provided that the sphere distribution is also uniform.
+     */
+    vec3 v = randomSpherePoint(rand);
+    return v * sign(dot(v, n));
+}
+
+vec3 randomCosineWeightedHemispherePoint(vec3 rand, vec3 n) {
+    float r = rand.x * 0.5 + 0.5;// [-1..1) -> [0..1)
+    float angle = (rand.y + 1.0) * PI;// [-1..1] -> [0..2*PI)
+    float sr = sqrt(r);
+    vec2 p = vec2(sr * cos(angle), sr * sin(angle));
+    /*
+     * Unproject disk point up onto hemisphere:
+     * 1.0 == sqrt(x*x + y*y + z*z) -> z = sqrt(1.0 - x*x - y*y)
+     */
+    vec3 ph = vec3(p.xy, sqrt(1.0 - p*p));
+    /*
+     * Compute some arbitrary tangent space for orienting
+     * our hemisphere 'ph' around the normal. We use the camera's up vector
+     * to have some fix reference vector over the whole screen.
+     */
+    vec3 tangent = normalize(rand);
+    vec3 bitangent = cross(tangent, n);
+    tangent = cross(bitangent, n);
+
+    /* Make our hemisphere orient around the normal. */
+    return tangent * ph.x + bitangent * ph.y + n * ph.z;
+}
+
+void HitMaterial(inout RayHit hit, in vec3 emission, in Material mat) {
+    hit.emission = emission;
+    hit.diffuse = mat.diffuse;
+    hit.specular = mat.specular;
+    hit.shininess = mat.shininess;
+    hit.ambience = mat.ambience;
+}
+
+bool IntersectPlane(in Ray ray, inout RayHit hit, in Plane plane)
+{
+    float d0 = dot(plane.normal, ray.direction);
+    if (d0 != 0)
+    {
+        float t = dot(plane.position - ray.origin, plane.normal) / d0;
+        if (t > Epsilon && t < hit.distance) {
+            hit.distance = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = plane.normal;
+            HitMaterial(hit, plane.color, plane.mat);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IntersectBox(in Ray ray, inout RayHit hit, in Box box)
+{
+    float tmin, tmax, t1, t2;
+
+    t1 = (box.min.x - ray.origin.x) * ray.inv_dir.x;
+    t2 = (box.max.x - ray.origin.x) * ray.inv_dir.x;
+    tmin = min(t1, t2);
+    tmax = max(t1, t2);
+
+    t1 = (box.min.y - ray.origin.y) * ray.inv_dir.y;
+    t2 = (box.max.y - ray.origin.y) * ray.inv_dir.y;
+    tmin = max(tmin, min(t1, t2));
+    tmax = min(tmax, max(t1, t2));
+
+    t1 = (box.min.z - ray.origin.z) * ray.inv_dir.z;
+    t2 = (box.max.z - ray.origin.z) * ray.inv_dir.z;
+    tmin = max(tmin, min(t1, t2));
+    tmax = min(tmax, max(t1, t2));
+
+    if (tmax > max(tmin, 0) && tmin < hit.distance && tmin > 0) {
+        hit.distance = tmin;
+        hit.position = ray.origin + tmin * ray.direction;
+        vec3 c = (box.min + box.max) * 0.5;
+        vec3 p = hit.position - c;
+        vec3 d = abs((box.min - box.max) * 0.5);
+        float bias = 1.0;
+        hit.normal = p / d * bias;
+        HitMaterial(hit, box.color, box.mat);
+        return true;
+    }
+ 
+    return false; 
+}
+
+bool IntersectSphere(in Ray ray, inout RayHit hit, in Sphere sphere)
+{
+    vec3 d = ray.origin - sphere.position;
+    float p1 = -dot(ray.direction, d);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+    if (p2sqr < 0) return false;
+
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+
+    if (t > Epsilon && t < hit.distance) {
+        hit.distance = t;
+        hit.position = ray.origin + ray.direction * t;
+        hit.normal = (hit.position - sphere.position) / sphere.radius;
+        HitMaterial(hit, sphere.color, sphere.mat);
+        return true;
+    }
+    return false;
+}
+
+bool TryIntersection(in Ray ray, inout RayHit hit)
+{
+    bool hitSomething = false;
+
+    for (int i = 0; i < planes.length(); i++) {
+        hitSomething = IntersectPlane(ray, hit, planes[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < spheres.length(); i++) {
+        hitSomething = IntersectSphere(ray, hit, spheres[i]) || hitSomething;
+    }
+
+    for (int i = 0; i < boxes.length(); i++) {
+        hitSomething = IntersectBox(ray, hit, boxes[i]) || hitSomething;
+    }
+
+    return hitSomething;
+}
+
+vec3 GetLitColor(in vec3 rayDir, in RayHit hit)
+{
+    vec3 lightVector = hit.position - env.lightPos;
+    vec3 lightDir = normalize(lightVector);   
+   	float lightIntensity = env.lightIntensity;  
+    return hit.emission;
+    
+   /* vec3 ambient = hit.ambience * hit.emission;
+    vec3 diffuse = hit.diffuse * max(-dot(lightDir, hit.normal), 0.) * hit.emission * lightIntensity;
+       
+    vec3 halfwayDir = normalize(lightDir + rayDir);  
+    vec3 specular = pow(max(-dot(hit.normal, halfwayDir), 0.), hit.shininess) * hit.specular * hit.emission * lightIntensity;
+    
+    return ambient + diffuse + specular;*/
+}
+
+vec3 ShadeSurface(in Ray ray, in RayHit hit)
+{
+    vec3 lightDir = normalize(env.lightPos - hit.position);
+    Ray shadowRay = CreateRay(ray.origin + ray.direction * (hit.distance - 0.01), lightDir);
+    RayHit shadowHit = CreateRayHit();
+    float dist = length(env.lightPos - shadowRay.origin);
+
+    if (TryIntersection(shadowRay, shadowHit)) {
+        if (shadowHit.distance < dist) {
+            return vec3(0.);
+        }
+    }
+    return vec3(1000.) * max(dot(hit.normal, -lightDir), 0.);
+}
+
+float fresnel(in vec3 normal, in vec3 dir, in float specular)
+{
+    return pow(1. - max(dot(normal, dir), 0.), 5.) * (1. - specular) + specular;
+}
+
+vec3 skyColor(in Ray ray)
+{
+    float transition = pow(smoothstep(0.02, .5, ray.direction.y), 0.4);
+    const vec3 lightColor = vec3(1.0);
+    const vec3 lightDir = normalize(ray.origin - env.lightPos);
+
+    vec3 sky = 2e2*mix(vec3(0.52, 0.77, 1), vec3(0.12, 0.43, 1), transition);
+    vec3 sun = lightColor * pow(abs(dot(ray.direction, lightDir)), 5000.);
+    return sky + sun;
+}
+
+vec3 TraceRay(inout Ray ray) {
+    vec3 colorAccumulation = vec3(0.);
+    vec3 attenution = vec3(1.);
+    RayHit hit;
+
+    for (int i = 0; i < MaxBounces; ++i) {
+        hit = CreateRayHit();
+        if (!TryIntersection(ray, hit)) {
+            colorAccumulation += attenution * skyColor(ray);
+            break;
+            //return colorAccumulation + (vec3(0.5098, 0.7529, 0.9137));// sky color
+        }
+
+        float f = fresnel(hit.normal, -ray.direction, hit.specular);
+        vec3 passColor = GetLitColor(ray.direction, hit);
+        vec3 shade = ShadeSurface(ray, hit);
+
+        colorAccumulation += (1. - f) * attenution * passColor * shade;
+        attenution *= f;
+
+        ray.origin = ray.origin + ray.direction * (hit.distance - 0.01);
+        ray.direction = reflect(ray.direction, hit.normal);
+        ray.inv_dir = 1. / ray.direction;
+    }
+
+    return colorAccumulation;
+}
+
+/*colorAccumulation += colorMask * hit.emissive;
+
+        vec3 nextDir = randomCosineWeightedHemispherePoint(randVec(), hit.normal);
+        colorMask *= dot(nextDir, hit.normal);
+        colorMask *= hit.emission;
+
+        ray.origin = hit.position + 0.001 * nextDir;
+        ray.direction = nextDir;*/
+
+vec3 Uncharted2ToneMapping(vec3 color)
+{
+	const float A = 0.15;
+	const float B = 0.50;
+	const float C = 0.10;
+	const float D = 0.20;
+	const float E = 0.02;
+	const float F = 0.30;
+	const float W = 11.2;
+	const float exposure = 0.012;
+	color *= exposure;
+	color = ((color * (A * color + C * B) + D * E) / (color * (A * color + B) + D * F)) - E / F;
+	float white = ((W * (A * W + C * B) + D * E) / (W * (A * W + B) + D * F)) - E / F;
+	color /= white;
+	color = pow(color, vec3(1. / GAMMA));
+	return color;
+}
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    uint idy = gl_GlobalInvocationID.y;
+
+    _Seed = 0;
+    _Pixel = vec2(idx, idy);
+
+    Ray ray;
+    vec3 color = vec3(0.0);
+    uint numSamples = 1;
+
+    for (int i = 0; i < numSamples; ++i) {
+        ray = CreateCameraRay(idx, idy);
+        color += TraceRay(ray);
+    }
+
+    color /= numSamples;
+    //color = vec3(clamp(color.x, 0.0, 1.0), clamp(color.y, 0.0, 1.0), clamp(color.z, 0.0, 1.0));
+    //color = vec3(planes[0].mat.specular);
+
+    imageStore(computeImage, ivec2(gl_GlobalInvocationID.xy), vec4(Uncharted2ToneMapping(color), 0.0));
+}
