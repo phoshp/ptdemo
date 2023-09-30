@@ -91,7 +91,7 @@ void VulkanRenderer::render() {
 
 	auto result = m_device->waitForFences(m_computeFence.get(), VK_TRUE, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
-		vk::throwResultException(result, "Failed to wait for fences");
+		vk::detail::throwResultException(result, "Failed to wait for fences");
 	}
 
 	auto r2 = m_device->acquireNextImageKHR(m_swapchain.handle.get(), UINT64_MAX, m_imageAcquiredSemaphore.get());
@@ -101,7 +101,7 @@ void VulkanRenderer::render() {
 		recreateSwapchain();
 		return;
 	} else if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
-		vk::throwResultException(result, "Failed to acquire swap chain image!");
+		vk::detail::throwResultException(result, "Failed to acquire swap chain image!");
 	}
 
 	recordComputeCommands();
@@ -111,7 +111,7 @@ void VulkanRenderer::render() {
 	vk::SubmitInfo submitInfo(m_imageAcquiredSemaphore.get(), waitStages, m_computeQueue.buffers, m_renderFinishedSemaphore.get());
 	result = m_computeQueue.handle.submit(1, &submitInfo, m_computeFence.get());
 	if (result != vk::Result::eSuccess)
-		vk::throwResultException(result, "Failed to submit Compute Command Buffers to Compute Queue !");
+		vk::detail::throwResultException(result, "Failed to submit Compute Command Buffers to Compute Queue !");
 
 	vk::PresentInfoKHR presentInfo(m_renderFinishedSemaphore.get(), m_swapchain.handle.get(), m_swapchain.currentFrame);
 	result = m_presentQueue.handle.presentKHR(&presentInfo);
@@ -120,7 +120,7 @@ void VulkanRenderer::render() {
 		m_resized = false;
 		recreateSwapchain();
 	} else if (result != vk::Result::eSuccess)
-		vk::throwResultException(result, "Failed to present swap chain image !");
+		vk::detail::throwResultException(result, "Failed to present swap chain image !");
 }
 
 void VulkanRenderer::cleanup() {
