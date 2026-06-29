@@ -5,7 +5,7 @@
 #ifndef PTDEMO_VULKANTYPES_HPP
 #define PTDEMO_VULKANTYPES_HPP
 
-#include <vk_mem_alloc.h>
+#include "vk_mem_alloc.h"
 #include <vulkan/vulkan.hpp>
 #include <glm/glm.hpp>
 #include <vector>
@@ -127,7 +127,7 @@ public:
 		pipeline.descriptorSetLayouts.resize(sets.size());
 
 		auto allocated = device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo(pipeline.descriptorPool.get(), layouts));
-		for (int i = 0; i < sets.size(); ++i) {
+		for (size_t i = 0; i < sets.size(); ++i) {
 			pipeline.descriptorSets[i] = allocated[i];
 			pipeline.descriptorSetLayouts[i] = vk::UniqueDescriptorSetLayout(layouts[i], device);
 

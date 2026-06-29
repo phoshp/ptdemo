@@ -3,6 +3,12 @@
 //
 
 #include "graphics/vulkan/VulkanRenderer.hpp"
+#include "graphics/vulkan/VulkanTypes.hpp"
+#include <iostream>
+#include <vulkan/vulkan_core.h>
+#include <vulkan/vulkan_enums.hpp>
+#include <vulkan/vulkan_handles.hpp>
+#include <vulkan/vulkan_structs.hpp>
 
 namespace ph {
 
@@ -205,7 +211,7 @@ void VulkanRenderer::createSwapchain() {
 			.set_desired_format({VK_FORMAT_R8G8B8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
 			.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
 			.set_desired_extent(m_windowExtent.width, m_windowExtent.height)
-			.set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+			.set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
 			.set_old_swapchain(m_swapchain.handle.get())
 			.build();
 	vkb::Swapchain value;
@@ -264,7 +270,8 @@ void VulkanRenderer::createQueue(vkt::Queue* const q, const vk::Queue& queue) co
 }
 
 void VulkanRenderer::createComputeImage() {
-	VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	VkImageCreateInfo info{};
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	info.imageType = VK_IMAGE_TYPE_2D;
 	info.format = (VkFormat)m_swapchain.imageFormat;
 	info.extent = {m_swapchain.extent.width, m_swapchain.extent.height, 1};
@@ -300,6 +307,10 @@ void VulkanRenderer::createComputeImage() {
 	m_computeImage.barrier.init(m_computeImage.handle, vk::ImageLayout::eUndefined, vk::AccessFlagBits::eNone, m_computeQueue.family);
 }
 
+void VulkanRenderer::createRenderPipeline(const std::string& /*shader*/) {
+	// TODO: complete render pipeline creation
+}
+
 void VulkanRenderer::createComputePipeline(const std::string& shaderFileName) {
 	auto imageInfo = vk::DescriptorImageInfo({}, m_computeImage.views[0].get(), vk::ImageLayout::eGeneral);
 	vkt::DescriptorPoolBuilder builder;
@@ -326,21 +337,6 @@ void VulkanRenderer::createComputePipeline(const std::string& shaderFileName) {
 	vk::ComputePipelineCreateInfo pipelineInfo({}, stageInfo, m_computePipeline.layout.get());
 
 	m_computePipeline.handle = m_device->createComputePipelineUnique(m_computePipeline.cache.get(), pipelineInfo).value;
-}
-
-std::vector<uint32_t> VulkanRenderer::readShaderFile(const std::string& filename) {
-	std::ifstream file(filename, std::ios::ate | std::ios::binary);
-
-	if (!file.is_open())
-		throw std::runtime_error("Failed to open binary file: " + filename);
-
-	auto fileSize = file.tellg();
-	std::vector<uint32_t> buffer(fileSize / sizeof(uint32_t));
-	file.seekg(0);
-	file.read((char*)buffer.data(), fileSize);
-	file.close();
-
-	return buffer;
 }
 
 void VulkanRenderer::recordComputeCommands() {

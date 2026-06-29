@@ -1,4 +1,5 @@
 #define VMA_IMPLEMENTATION
+#include "graphics/vulkan/vk_mem_alloc.h"
 #define STB_IMAGE_IMPLEMENTATION
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 

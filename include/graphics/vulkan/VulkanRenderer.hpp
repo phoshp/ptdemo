@@ -14,6 +14,7 @@
 #include <SDL2/SDL_vulkan.h>
 #include <string>
 #include <shaderc/shaderc.hpp>
+#include <sstream>
 
 #include <functional>
 
@@ -56,9 +57,9 @@ private:
 
 	void createComputeImage();
 
-	void createComputePipeline(const std::string& shaderFileName);
+    void createRenderPipeline(const std::string& shader);
 
-	std::vector<uint32_t> readShaderFile(const std::string& filename);
+	void createComputePipeline(const std::string& shaderFileName);
 
 	void recordComputeCommands();
 
